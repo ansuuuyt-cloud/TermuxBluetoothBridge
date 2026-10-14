@@ -1,76 +1,385 @@
-name: Build Bluetooth Bridge APK
+package com.example.termuxbtbridge;
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - '*.zip'
-      - '.github/workflows/build.yml'
+import android.Manifest;
+import android.app.Activity;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanResult;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
-permissions:
-  contents: read
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CopyOnWriteArrayList;
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+import org.json.JSONArray;
+import org.json.JSONObject;
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+public class MainActivity extends Activity {
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+    private final CopyOnWriteArrayList<JSONObject> devices =
+            new CopyOnWriteArrayList<>();
 
-      - name: Locate Android SDK
-        run: |
-          echo "ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> "$GITHUB_ENV"
+    private final Handler handler =
+            new Handler(Looper.getMainLooper());
 
-      - name: Install Android SDK packages
-        run: |
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          SDKMANAGER=$(find "$SDK/cmdline-tools" -type f -name sdkmanager | head -n 1)
+    private BluetoothAdapter adapter;
+    private BluetoothLeScanner scanner;
+    private ScanCallback scanCallbackRef;
 
-          if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager was not found."
-            find "$SDK" -maxdepth 4 -type f -name sdkmanager
-            exit 1
-          fi
+    private volatile boolean scanning = false;
+    private volatile String lastError = "";
 
-          yes | "$SDKMANAGER" --licenses || true
-          "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0"
+    private TextView status;
+    private ServerSocket server;
 
-      - name: Find and extract project
-        run: |
-          ZIP_FILE=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
+    @Override
+    public void onCreate(Bundle b) {
+        super.onCreate(b);
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: Project ZIP not found."
-            exit 1
-          fi
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(24, 36, 24, 24);
 
-          mkdir -p source
-          unzip -o "$ZIP_FILE" -d source
+        TextView title = new TextView(this);
+        title.setText("Termux Bluetooth Bridge");
+        title.setTextSize(24);
 
-          if [ ! -f source/settings.gradle ] || [ ! -d source/app ]; then
-            echo "ERROR: Android project structure is incorrect."
-            find source -maxdepth 4 -type f
-            exit 1
-          fi
+        TextView desc = new TextView(this);
+        desc.setText(
+                "BLE scanner + localhost API\n" +
+                "Keep this app open while using Termux.\n" +
+                "API: http://127.0.0.1:8765"
+        );
+        desc.setTextSize(16);
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
+        status = new TextView(this);
+        status.setTextSize(16);
+        status.setPadding(0, 28, 0, 0);
 
-      - name: Build APK
-        run: |
-          gradle -p source assembleDebug --stacktrace
+        root.addView(title);
+        root.addView(desc);
+        root.addView(status);
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Bluetooth-Bridge-APK
+        setContentView(root);
+
+        BluetoothManager bm =
+                (BluetoothManager) getSystemService(
+                        Context.BLUETOOTH_SERVICE
+                );
+
+        if (bm != null) {
+            adapter = bm.getAdapter();
+        }
+
+        requestNeededPermissions();
+        startHttpServer();
+        updateStatus("Starting bridge...");
+    }
+
+    private void requestNeededPermissions() {
+        if (Build.VERSION.SDK_INT >= 23) {
+            java.util.ArrayList<String> permissions =
+                    new java.util.ArrayList<>();
+
+            if (checkSelfPermission(
+                    Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(
+                        Manifest.permission.ACCESS_FINE_LOCATION
+                );
+            }
+
+            if (!permissions.isEmpty()) {
+                requestPermissions(
+                        permissions.toArray(new String[0]),
+                        5
+                );
+            }
+        }
+    }
+
+    private void updateStatus(String message) {
+        handler.post(() -> status.setText(message));
+    }
+
+    private JSONObject deviceJson(
+            BluetoothDevice device,
+            int rssi
+    ) {
+        JSONObject object = new JSONObject();
+
+        try {
+            String name = device.getName();
+            object.put("name", name == null ? "" : name);
+            object.put("address", device.getAddress());
+            object.put("rssi", rssi);
+        } catch (Exception ignored) {
+        }
+
+        return object;
+    }
+
+    private synchronized String scanNow() {
+        if (adapter == null) {
+            lastError = "Bluetooth adapter unavailable";
+            return lastError;
+        }
+
+        if (!adapter.isEnabled()) {
+            lastError = "Bluetooth is off";
+            return lastError;
+        }
+
+        if (Build.VERSION.SDK_INT >= 23 &&
+                checkSelfPermission(
+                        Manifest.permission.ACCESS_FINE_LOCATION
+                ) != PackageManager.PERMISSION_GRANTED) {
+
+            lastError = "Location permission not granted";
+            return lastError;
+        }
+
+        try {
+            scanner = adapter.getBluetoothLeScanner();
+
+            if (scanner == null) {
+                lastError = "BLE scanner unavailable";
+                return lastError;
+            }
+
+            devices.clear();
+            lastError = "";
+            scanning = true;
+
+            scanCallbackRef = new ScanCallback() {
+
+                @Override
+                public void onScanResult(
+                        int callbackType,
+                        ScanResult result
+                ) {
+                    BluetoothDevice device = result.getDevice();
+                    String address = device.getAddress();
+
+                    for (JSONObject item : devices) {
+                        if (address.equals(
+                                item.optString("address")
+                        )) {
+                            devices.remove(item);
+                            break;
+                        }
+                    }
+
+                    devices.add(
+                            deviceJson(device, result.getRssi())
+                    );
+                }
+
+                @Override
+                public void onScanFailed(int errorCode) {
+                    lastError =
+                            "BLE scan failed, code=" + errorCode;
+                    scanning = false;
+                }
+            };
+
+            scanner.startScan(scanCallbackRef);
+
+            handler.postDelayed(() -> {
+                try {
+                    if (scanner != null &&
+                            scanCallbackRef != null) {
+                        scanner.stopScan(scanCallbackRef);
+                    }
+                } catch (Exception ignored) {
+                }
+
+                scanning = false;
+
+                updateStatus(
+                        "Scan finished. Devices: " +
+                        devices.size() +
+                        "\nAPI: http://127.0.0.1:8765/devices"
+                );
+
+            }, 8000);
+
+            updateStatus("Scanning BLE devices for 8 seconds...");
+
+            return "Scan started (8 seconds)";
+
+        } catch (Exception e) {
+            lastError = e.getClass().getSimpleName()
+                    + ": " + e.getMessage();
+
+            scanning = false;
+            return lastError;
+        }
+    }
+
+    private void startHttpServer() {
+        Thread thread = new Thread(() -> {
+            try {
+                server = new ServerSocket(
+                        8765,
+                        10,
+                        java.net.InetAddress.getByName("127.0.0.1")
+                );
+
+                updateStatus(
+                        "Bridge running on 127.0.0.1:8765\n" +
+                        "Open Termux and use curl."
+                );
+
+                while (!server.isClosed()) {
+                    Socket client = server.accept();
+
+                    new Thread(
+                            () -> handle(client)
+                    ).start();
+                }
+
+            } catch (Exception e) {
+                updateStatus(
+                        "Local API error: " + e.getMessage()
+                );
+            }
+        }, "bridge-http");
+
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void handle(Socket socket) {
+        try (Socket client = socket) {
+
+            client.setSoTimeout(2500);
+
+            BufferedReader input = new BufferedReader(
+                    new InputStreamReader(
+                            client.getInputStream(),
+                            StandardCharsets.UTF_8
+                    )
+            );
+
+            String request = input.readLine();
+
+            if (request == null) {
+                return;
+            }
+
+            String[] parts = request.split(" ");
+
+            if (parts.length < 2) {
+                return;
+            }
+
+            String path = parts[1].split("\\?")[0];
+
+            String body;
+            int code = 200;
+
+            if (path.equals("/")) {
+
+                body = "{\"app\":\"Termux BT Bridge\"," +
+                        "\"endpoints\":[\"/status\"," +
+                        "\"/scan\",\"/devices\"]}";
+
+            } else if (path.equals("/status")) {
+
+                JSONObject object = new JSONObject();
+
+                object.put("ok", true);
+                object.put("scanning", scanning);
+                object.put("deviceCount", devices.size());
+                object.put("error", lastError);
+
+                body = object.toString();
+
+            } else if (path.equals("/scan")) {
+
+                JSONObject object = new JSONObject();
+                object.put("result", scanNow());
+
+                body = object.toString();
+
+            } else if (path.equals("/devices")) {
+
+                JSONArray array = new JSONArray();
+
+                for (JSONObject device : devices) {
+                    array.put(device);
+                }
+
+                JSONObject object = new JSONObject();
+                object.put("devices", array);
+                object.put("scanning", scanning);
+                object.put("error", lastError);
+
+                body = object.toString();
+
+            } else {
+
+                code = 404;
+                body = "{\"error\":\"not found\"}";
+            }
+
+            byte[] bytes = body.getBytes(
+                    StandardCharsets.UTF_8
+            );
+
+            OutputStream output = client.getOutputStream();
+
+            String header =
+                    "HTTP/1.1 " + code +
+                    (code == 200 ? " OK" : " Not Found") +
+                    "\r\nContent-Type: application/json; charset=utf-8" +
+                    "\r\nAccess-Control-Allow-Origin: *" +
+                    "\r\nConnection: close" +
+                    "\r\nContent-Length: " + bytes.length +
+                    "\r\n\r\n";
+
+            output.write(
+                    header.getBytes(StandardCharsets.UTF_8)
+            );
+
+            output.write(bytes);
+            output.flush();
+
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+
+        try {
+            if (scanner != null && scanCallbackRef != null) {
+                scanner.stopScan(scanCallbackRef);
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            if (server != null) {
+                server.close();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+}
